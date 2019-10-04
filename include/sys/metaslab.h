@@ -134,6 +134,8 @@ void metaslab_recalculate_weight_and_sort(metaslab_t *);
 void metaslab_disable(metaslab_t *);
 void metaslab_enable(metaslab_t *, boolean_t, boolean_t);
 void metaslab_set_selected_txg(metaslab_t *, uint64_t);
+range_seg_type_t metaslab_calculate_range_tree_type(vdev_t *, metaslab_t *,
+    uint64_t *, uint64_t *);
 
 extern int metaslab_debug_load;
 

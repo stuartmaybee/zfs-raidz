@@ -2217,6 +2217,8 @@ spa_load_verify_done(zio_t *zio)
 int spa_load_verify_shift = 4;
 int spa_load_verify_metadata = B_TRUE;
 int spa_load_verify_data = B_TRUE;
+int spa_load_verify_spacemaps = B_TRUE;
+int spa_load_reconstruct_spacemaps = B_FALSE;
 
 /*ARGSUSED*/
 static int
@@ -2255,12 +2257,371 @@ spa_load_verify_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 }
 
 /* ARGSUSED */
-int
+static int
 verify_dataset_name_len(dsl_pool_t *dp, dsl_dataset_t *ds, void *arg)
 {
 	if (dsl_dataset_namelen(ds) >= ZFS_MAX_DATASET_NAME_LEN)
 		return (SET_ERROR(ENAMETOOLONG));
 
+	return (0);
+}
+
+static int
+spa_verify_spacamaps_blkptr_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
+    const zbookmark_phys_t *zb, const dnode_phys_t *dnp, void *arg)
+{
+	if (zb->zb_level == ZB_DNODE_LEVEL)
+		return (0);
+
+	if (BP_IS_HOLE(bp) || BP_IS_REDACTED(bp))
+		return (0);
+
+	if (zilog != NULL && zil_bp_tree_add(zilog, bp) != 0)
+		return (0);
+
+	if (BP_IS_EMBEDDED(bp))
+		return (0);
+
+	if (BP_GET_DEDUP(bp)) {
+		/* XXX need to count via DDT */
+		return (0);
+	}
+
+	VERIFY0(zio_wait(zio_claim(NULL, spa,
+	    spa_min_claim_txg(spa),
+	    bp, NULL, NULL, ZIO_FLAG_CANFAIL)));
+
+	return (0);
+}
+
+static int
+spa_load_verify_bpobj_cb(void *arg, const blkptr_t *bp, boolean_t bp_freed,
+    dmu_tx_t *tx)
+{
+	spa_t *spa = arg;
+	ASSERT(!bp_freed);
+	return (zio_wait(zio_claim(NULL, spa,
+	    spa_min_claim_txg(spa),
+	    bp, NULL, NULL, ZIO_FLAG_CANFAIL)));
+}
+
+static int
+count_block_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
+{
+	spa_t *spa = arg;
+	return (zio_wait(zio_claim(NULL, spa,
+	    spa_min_claim_txg(spa),
+	    bp, NULL, NULL, ZIO_FLAG_CANFAIL)));
+}
+
+/*
+ * Iterate over livelists which have been destroyed by the user but
+ * are still present in the MOS, waiting to be freed
+ */
+typedef void ll_iter_t(dsl_deadlist_t *ll, void *arg);
+
+static void
+iterate_deleted_livelists(spa_t *spa, ll_iter_t func, void *arg)
+{
+	objset_t *mos = spa->spa_meta_objset;
+	uint64_t zap_obj;
+	int err = zap_lookup(mos, DMU_POOL_DIRECTORY_OBJECT,
+	    DMU_POOL_DELETED_CLONES, sizeof (uint64_t), 1, &zap_obj);
+	if (err == ENOENT)
+		return;
+	ASSERT0(err);
+
+	zap_cursor_t zc;
+	zap_attribute_t attr;
+	dsl_deadlist_t ll;
+	/* NULL out os prior to dsl_deadlist_open in case it's garbage */
+	ll.dl_os = NULL;
+	for (zap_cursor_init(&zc, mos, zap_obj);
+	    zap_cursor_retrieve(&zc, &attr) == 0;
+	    (void) zap_cursor_advance(&zc)) {
+		dsl_deadlist_open(&ll, mos, attr.za_first_integer);
+		func(&ll, arg);
+		dsl_deadlist_close(&ll);
+	}
+	zap_cursor_fini(&zc);
+}
+
+static int
+livelist_entry_count_blocks_cb(void *arg, dsl_deadlist_entry_t *dle)
+{
+	spa_t *spa = arg;
+	bplist_t blks;
+	bplist_create(&blks);
+	/* determine which blocks have been alloc'd but not freed */
+	VERIFY0(dsl_process_sub_livelist(&dle->dle_bpobj, &blks, NULL, NULL));
+	/* count those blocks */
+	(void) bplist_iterate(&blks, count_block_cb, spa, NULL);
+	bplist_destroy(&blks);
+	return (0);
+}
+
+static void
+livelist_count_blocks(dsl_deadlist_t *ll, void *arg)
+{
+	dsl_deadlist_iterate(ll, livelist_entry_count_blocks_cb, arg);
+}
+
+/* ARGSUSED */
+static void
+claim_segment_impl_cb(uint64_t inner_offset, vdev_t *vd, uint64_t offset,
+    uint64_t size, void *arg)
+{
+	/*
+	 * This callback was called through a remap from
+	 * a device being removed. Therefore, the vdev that
+	 * this callback is applied to is a concrete
+	 * vdev.
+	 */
+	ASSERT(vdev_is_concrete(vd));
+
+	VERIFY0(metaslab_claim_impl(vd, offset, size,
+	    spa_min_claim_txg(vd->vdev_spa)));
+}
+
+static void
+claim_segment_cb(void *arg, uint64_t offset, uint64_t size)
+{
+	vdev_t *vd = arg;
+
+	vdev_indirect_ops.vdev_op_remap(vd, offset, size,
+	    claim_segment_impl_cb, NULL);
+}
+
+/*
+ * After accounting for all allocated blocks that are directly referenced,
+ * we might have missed a reference to a block from a partially complete
+ * (and thus unused) indirect mapping object. We perform a secondary pass
+ * through the metaslabs we have already mapped and claim the destination
+ * blocks.
+ */
+static void
+zdb_claim_removing(spa_t *spa)
+{
+	if (spa->spa_vdev_removal == NULL)
+		return;
+
+	spa_config_enter(spa, SCL_CONFIG, FTAG, RW_READER);
+
+	spa_vdev_removal_t *svr = spa->spa_vdev_removal;
+	vdev_t *vd = vdev_lookup_top(spa, svr->svr_vdev_id);
+	vdev_indirect_mapping_t *vim = vd->vdev_indirect_mapping;
+
+	range_tree_t *allocs = range_tree_create(NULL, RANGE_SEG64, NULL, 0, 0);
+	range_tree_add(allocs, 0, vd->vdev_asize);
+	for (uint64_t msi = 0; msi < vd->vdev_ms_count; msi++) {
+		metaslab_t *msp = vd->vdev_ms[msi];
+
+		if (msp->ms_start >= vdev_indirect_mapping_max_offset(vim))
+			break;
+
+		ASSERT0(range_tree_space(allocs));
+		range_tree_walk(msp->ms_allocatable,
+		    range_tree_remove, allocs);
+	}
+
+	/*
+	 * Clear everything past what has been synced,
+	 * because we have not allocated mappings for
+	 * it yet.
+	 */
+	range_tree_clear(allocs,
+	    vdev_indirect_mapping_max_offset(vim),
+	    vd->vdev_asize - vdev_indirect_mapping_max_offset(vim));
+
+	range_tree_vacate(allocs, claim_segment_cb, vd);
+	range_tree_destroy(allocs);
+	spa_config_exit(spa, SCL_CONFIG, FTAG);
+}
+
+#if 0
+static void
+spa_verify_spacemaps_range_cb(void *arg, uint64_t start, uint64_t size)
+{
+	metaslab_t *ms = arg;
+
+	/*
+	 * XXX check if removal will succeed and print better error message,
+	 * perhaps using range_tree_find_in().  Failing removals indicates
+	 * leaked space (no BP's reference it, thus it's in the bp_allocatable,
+	 * but the spacemaps think it's not allocatable, so it's not in
+	 * ms_allocatable.
+	 */
+
+	range_tree_remove(ms->ms_allocatable, start, size);
+}
+#endif
+
+static int
+spa_verify_spacemaps(spa_t *spa)
+{
+	for (int c = 0; c < spa->spa_root_vdev->vdev_children; c++) {
+		vdev_t *vd = spa->spa_root_vdev->vdev_child[c];
+		for (int m = 0; m < vd->vdev_ms_count; m++) {
+			metaslab_t *ms = vd->vdev_ms[m];
+			mutex_enter(&ms->ms_lock);
+			ASSERT(!ms->ms_loaded);
+			ASSERT(!ms->ms_loading);
+			ASSERT(!ms->ms_condensing);
+			ASSERT(!ms->ms_flushing);
+			ASSERT(ms->ms_allocatable->rt_arg == NULL);
+			ASSERT(range_tree_is_empty(ms->ms_allocatable));
+
+			/*
+			 * Mark everything as allocatable.
+			 */
+			range_tree_add(ms->ms_allocatable,
+			    ms->ms_start, ms->ms_size);
+			ms->ms_loaded = B_TRUE;
+			/* Note: not tracking ms_allocatable_by_size */
+			mutex_exit(&ms->ms_lock);
+		}
+	}
+
+	/*
+	 * Tell the zio_claim() code path to only modify ms_allocatable,
+	 * to not dirty metaslabs, and to not modify ms_allocating.
+	 */
+	spa->spa_verifying_spacemaps = B_TRUE;
+
+	/*
+	 * Claim all referenced blocks.
+	 * XXX lots more to do here
+	 */
+	int error = traverse_pool(spa, 0,
+	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
+	    TRAVERSE_NO_DECRYPT | TRAVERSE_HARD,
+	    spa_verify_spacamaps_blkptr_cb, NULL);
+	VERIFY0(error);
+
+	ddt_bookmark_t ddb = { 0 };
+	ddt_entry_t dde;
+	while ((error = ddt_walk(spa, &ddb, &dde)) == 0) {
+		ddt_phys_t *ddp = dde.dde_phys;
+
+		ASSERT(ddt_phys_total_refcnt(&dde) > 1);
+
+		for (int p = 0; p < DDT_PHYS_TYPES; p++, ddp++) {
+			if (ddp->ddp_phys_birth == 0)
+				continue;
+			blkptr_t bp;
+			ddt_bp_create(ddb.ddb_checksum,
+			    &dde.dde_key, ddp, &bp);
+			VERIFY0(zio_wait(zio_claim(NULL, spa,
+			    spa_min_claim_txg(spa),
+			    &bp, NULL, NULL, ZIO_FLAG_CANFAIL)));
+		}
+	}
+	VERIFY3U(error, ==, ENOENT);
+
+	(void) bpobj_iterate_nofree(&spa->spa_deferred_bpobj,
+	    spa_load_verify_bpobj_cb, spa, NULL);
+
+	if (spa_version(spa) >= SPA_VERSION_DEADLISTS) {
+		(void) bpobj_iterate_nofree(&spa->spa_dsl_pool->dp_free_bpobj,
+		    spa_load_verify_bpobj_cb, spa, NULL);
+	}
+
+	if (spa_feature_is_active(spa, SPA_FEATURE_ASYNC_DESTROY)) {
+		VERIFY0(bptree_iterate(spa->spa_meta_objset,
+		    spa->spa_dsl_pool->dp_bptree_obj, B_FALSE, count_block_cb,
+		    spa, NULL));
+	}
+
+	iterate_deleted_livelists(spa, livelist_count_blocks, spa);
+
+	/*
+	 * We need to do this last, since it relies on the ms_allocatable state
+	 * that we've built up.
+	 */
+	zdb_claim_removing(spa);
+
+	spa->spa_verifying_spacemaps = B_FALSE;
+
+	for (int c = 0; c < spa->spa_root_vdev->vdev_children; c++) {
+		vdev_t *vd = spa->spa_root_vdev->vdev_child[c];
+		for (int m = 0; m < vd->vdev_ms_count; m++) {
+			metaslab_t *ms = vd->vdev_ms[m];
+			mutex_enter(&ms->ms_lock);
+			range_seg_type_t type;
+			uint64_t shift, start;
+			type = metaslab_calculate_range_tree_type(vd, ms,
+			    &start, &shift);
+
+			/*
+			 * Save reconstructed state based on block pointer
+			 * traversal, and return metaslab to previous, unloaded
+			 * state.
+			 */
+;			range_tree_t *bp_allocatable =
+			    ms->ms_allocatable;
+
+			ms->ms_allocatable = range_tree_create(NULL,
+			    type, NULL, start, shift);
+			ms->ms_loaded = B_FALSE;
+
+			/*
+			 * Load ms_allocatable from spacemap and compare with
+			 * tree reconstructed from block pointer traversal.
+			 */
+			VERIFY0(metaslab_load(ms));
+
+			range_tree_t *rt_saved = range_tree_create(NULL,
+			   type, NULL, start, shift);
+			range_tree_walk(ms->ms_allocatable,
+			    range_tree_add, rt_saved);
+
+			/*
+			 * XXX check if removal will succeed and print better
+			 * error message, perhaps using range_tree_find_in().
+			 * Failing removals indicates leaked space (no BP's
+			 * reference it, thus it's in the bp_allocatable, but
+			 * the spacemaps think it's not allocatable, so it's not
+			 * in ms_allocatable.
+			 */
+			range_tree_walk(bp_allocatable,
+			    range_tree_remove, rt_saved);
+			/*
+			range_tree_walk(bp_allocatable,
+			    spa_verify_spacemaps_range_cb, ms);
+			    */
+
+			/*
+			 * XXX print better error message if there segments left
+			 * Leftover segments indicate space that's referenced by
+			 * BP's but the spacemaps indicate is free
+			 * (allocatable).
+			 */
+			VERIFY(range_tree_is_empty(rt_saved));
+			range_tree_destroy(rt_saved);
+
+			if (spa_load_reconstruct_spacemaps) {
+				/*
+				 * Note: we can't simply set ms_allocatable
+				 * to bp_allocatable, because ms_allocatable
+				 * has the rt_ops/rt_arg set.
+				 */
+				range_tree_vacate(ms->ms_allocatable,
+				    NULL, NULL);
+				range_tree_vacate(bp_allocatable,
+				    range_tree_add, ms->ms_allocatable);
+				range_tree_destroy(bp_allocatable);
+				ms->ms_condense_wanted = B_TRUE;
+			} else {
+				range_tree_vacate(bp_allocatable, NULL, NULL);
+				range_tree_destroy(bp_allocatable);
+			}
+
+			mutex_exit(&ms->ms_lock);
+
+			zfs_dbgmsg("verified vdev %u metaslab %u",
+				c, m);
+		}
+	}
 	return (0);
 }
 
@@ -2333,6 +2694,10 @@ spa_load_verify(spa_t *spa)
 		    ZPOOL_CONFIG_LOAD_DATA_ERRORS, sle.sle_data_count) == 0);
 	} else {
 		spa->spa_load_max_txg = spa->spa_uberblock.ub_txg;
+	}
+
+	if (spa_load_verify_spacemaps) { /* XXX && requested by policy? */
+		error = spa_verify_spacemaps(spa);
 	}
 
 	if (spa_load_verify_dryrun)
@@ -9651,6 +10016,12 @@ ZFS_MODULE_PARAM(zfs_spa, spa_, load_verify_metadata, INT, ZMOD_RW,
 
 ZFS_MODULE_PARAM(zfs_spa, spa_, load_verify_data, INT, ZMOD_RW,
 	"Set to traverse data on pool import");
+
+ZFS_MODULE_PARAM(zfs_spa, spa_, load_verify_spacemaps, INT, ZMOD_RW,
+	"Set to verify spacemaps on pool import");
+
+ZFS_MODULE_PARAM(zfs_spa, spa_, load_reconstruct_spacemaps, INT, ZMOD_RW,
+	"Set to reconstruct spacemaps on pool import");
 
 ZFS_MODULE_PARAM(zfs_spa, spa_, load_print_vdev_tree, INT, ZMOD_RW,
 	"Print vdev tree to zfs_dbgmsg during pool import");

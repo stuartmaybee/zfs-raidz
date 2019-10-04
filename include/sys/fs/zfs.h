@@ -749,6 +749,9 @@ typedef struct zpool_load_policy {
 #define	ZPOOL_LOAD_REQUEST_TXG		"load-request-txg"
 #define	ZPOOL_LOAD_META_THRESH		"load-meta-thresh"
 #define	ZPOOL_LOAD_DATA_THRESH		"load-data-thresh"
+/* XXX need to plumb these through from CLI flag to zpool_get_load_policy() */
+#define	ZPOOL_LOAD_CHECK_SPACEMAPS	"load-check-spacemaps"
+#define	ZPOOL_LOAD_RECONSTRUCT_SPACEMAPS "load-reconstruct-spacemaps"
 
 /* Rewind data discovered */
 #define	ZPOOL_CONFIG_LOAD_TIME		"rewind_txg_ts"
