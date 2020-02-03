@@ -5730,7 +5730,8 @@ top:
 				mutex_exit(hash_lock);
 				goto top;
 			}
-			ASSERT(*arc_flags & ARC_FLAG_NOWAIT);
+			ASSERT(*arc_flags & ARC_FLAG_NOWAIT ||
+			    *arc_flags & ARC_FLAG_NOWAIT_FASTER);
 
 			if (done) {
 				arc_callback_t *acb = NULL;
@@ -6098,6 +6099,10 @@ top:
 				if (*arc_flags & ARC_FLAG_NOWAIT) {
 					zio_nowait(rzio);
 					goto out;
+				} else if (*arc_flags &
+				    ARC_FLAG_NOWAIT_FASTER) {
+					zio_nowait_faster(rzio);
+					goto out;
 				}
 
 				ASSERT(*arc_flags & ARC_FLAG_WAIT);
@@ -6141,9 +6146,12 @@ top:
 			rc = zio_wait(rzio);
 			goto out;
 		}
-
-		ASSERT(*arc_flags & ARC_FLAG_NOWAIT);
-		zio_nowait(rzio);
+		if (*arc_flags & ARC_FLAG_NOWAIT) {
+			zio_nowait(rzio);
+		} else {
+			ASSERT(*arc_flags & ARC_FLAG_NOWAIT_FASTER);
+			zio_nowait_faster(rzio);
+		}
 	}
 
 out:
