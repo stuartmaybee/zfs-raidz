@@ -1028,6 +1028,12 @@ dump_metaslab(metaslab_t *msp)
 		mutex_enter(&msp->ms_lock);
 		VERIFY0(metaslab_load(msp));
 		range_tree_stat_verify(msp->ms_allocatable);
+		/*
+		 * Note: The log spacemaps have not been loaded, because the
+		 * pool is readonly (see spa_ld_log_sm_data()).  Therefore
+		 * the metaslab stats only reflect flushed operations (not
+		 * operations that are only in the log spacemaps).
+		 */
 		dump_metaslab_stats(msp);
 		metaslab_unload(msp);
 		mutex_exit(&msp->ms_lock);
@@ -4798,9 +4804,6 @@ count_unflushed_space_cb(spa_t *spa, space_map_entry_t *sme,
 static int64_t
 get_unflushed_alloc_space(spa_t *spa)
 {
-	if (dump_opt['L'])
-		return (0);
-
 	int64_t ualloc_space = 0;
 	iterate_through_spacemap_logs(spa, count_unflushed_space_cb,
 	    &ualloc_space);
@@ -4981,11 +4984,6 @@ zdb_leak_init_prepare_indirect_vdevs(spa_t *spa, zdb_cb_t *zcb)
 static void
 zdb_leak_init(spa_t *spa, zdb_cb_t *zcb)
 {
-	zcb->zcb_spa = spa;
-
-	if (dump_opt['L'])
-		return;
-
 	dsl_pool_t *dp = spa->spa_dsl_pool;
 	vdev_t *rvd = spa->spa_root_vdev;
 
@@ -5122,9 +5120,6 @@ zdb_check_for_obsolete_leaks(vdev_t *vd, zdb_cb_t *zcb)
 static boolean_t
 zdb_leak_fini(spa_t *spa, zdb_cb_t *zcb)
 {
-	if (dump_opt['L'])
-		return (B_FALSE);
-
 	boolean_t leaks = B_FALSE;
 	vdev_t *rvd = spa->spa_root_vdev;
 	for (unsigned c = 0; c < rvd->vdev_children; c++) {
@@ -5286,16 +5281,9 @@ deleted_livelists_dump_mos(spa_t *spa)
 static int
 dump_block_stats(spa_t *spa)
 {
-	zdb_cb_t zcb;
-	zdb_blkstats_t *zb, *tzb;
-	uint64_t norm_alloc, norm_space, total_alloc, total_found;
-	int flags = TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
-	    TRAVERSE_NO_DECRYPT | TRAVERSE_HARD;
 	boolean_t leaks = B_FALSE;
-	int e, c, err;
-	bp_embedded_type_t i;
+	int err;
 
-	bzero(&zcb, sizeof (zcb));
 	(void) printf("\nTraversing all blocks %s%s%s%s%s...\n\n",
 	    (dump_opt['c'] || !dump_opt['L']) ? "to verify " : "",
 	    (dump_opt['c'] == 1) ? "metadata " : "",
@@ -5315,8 +5303,11 @@ dump_block_stats(spa_t *spa)
 	 * pool claiming each block we discover, but we skip opening any space
 	 * maps.
 	 */
-	bzero(&zcb, sizeof (zdb_cb_t));
-	zdb_leak_init(spa, &zcb);
+	zdb_cb_t zcb;
+	bzero(&zcb, sizeof (zcb));
+	zcb.zcb_spa = spa;
+	if (!dump_opt['L'])
+		zdb_leak_init(spa, &zcb);
 
 	/*
 	 * If there's a deferred-free bplist, process that first.
@@ -5339,6 +5330,8 @@ dump_block_stats(spa_t *spa)
 
 	deleted_livelists_count_blocks(spa, &zcb);
 
+	int flags = TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA |
+	    TRAVERSE_NO_DECRYPT | TRAVERSE_HARD;
 	if (dump_opt['c'] > 1)
 		flags |= TRAVERSE_PREFETCH_DATA;
 
@@ -5354,7 +5347,7 @@ dump_block_stats(spa_t *spa)
 	 * all async I/Os to complete.
 	 */
 	if (dump_opt['c']) {
-		for (c = 0; c < max_ncpus; c++) {
+		for (int c = 0; c < max_ncpus; c++) {
 			(void) zio_wait(spa->spa_async_zio_root[c]);
 			spa->spa_async_zio_root[c] = zio_root(spa, NULL, NULL,
 			    ZIO_FLAG_CANFAIL | ZIO_FLAG_SPECULATIVE |
@@ -5372,7 +5365,7 @@ dump_block_stats(spa_t *spa)
 	if (zcb.zcb_haderrors) {
 		(void) printf("\nError counts:\n\n");
 		(void) printf("\t%5s  %s\n", "errno", "count");
-		for (e = 0; e < 256; e++) {
+		for (int e = 0; e < 256; e++) {
 			if (zcb.zcb_errors[e] != 0) {
 				(void) printf("\t%5d  %llu\n",
 				    e, (u_longlong_t)zcb.zcb_errors[e]);
@@ -5380,35 +5373,35 @@ dump_block_stats(spa_t *spa)
 		}
 	}
 
+	zdb_blkstats_t *tzb = &zcb.zcb_type[ZB_TOTAL][ZDB_OT_TOTAL];
+	uint64_t norm_alloc = metaslab_class_get_alloc(spa_normal_class(spa));
+	uint64_t norm_space = metaslab_class_get_space(spa_normal_class(spa));
+
 	/*
 	 * Report any leaked segments.
 	 */
-	leaks |= zdb_leak_fini(spa, &zcb);
+	if (!dump_opt['L']) {
+		leaks |= zdb_leak_fini(spa, &zcb);
 
-	tzb = &zcb.zcb_type[ZB_TOTAL][ZDB_OT_TOTAL];
+		uint64_t total_alloc = norm_alloc +
+		    metaslab_class_get_alloc(spa_log_class(spa)) +
+		    metaslab_class_get_alloc(spa_special_class(spa)) +
+		    metaslab_class_get_alloc(spa_dedup_class(spa)) +
+		    get_unflushed_alloc_space(spa);
+		uint64_t total_found = tzb->zb_asize - zcb.zcb_dedup_asize +
+		    zcb.zcb_removing_size + zcb.zcb_checkpoint_size;
 
-	norm_alloc = metaslab_class_get_alloc(spa_normal_class(spa));
-	norm_space = metaslab_class_get_space(spa_normal_class(spa));
-
-	total_alloc = norm_alloc +
-	    metaslab_class_get_alloc(spa_log_class(spa)) +
-	    metaslab_class_get_alloc(spa_special_class(spa)) +
-	    metaslab_class_get_alloc(spa_dedup_class(spa)) +
-	    get_unflushed_alloc_space(spa);
-	total_found = tzb->zb_asize - zcb.zcb_dedup_asize +
-	    zcb.zcb_removing_size + zcb.zcb_checkpoint_size;
-
-	if (total_found == total_alloc && !dump_opt['L']) {
-		(void) printf("\n\tNo leaks (block sum matches space"
-		    " maps exactly)\n");
-	} else if (!dump_opt['L']) {
-		(void) printf("block traversal size %llu != alloc %llu "
-		    "(%s %lld)\n",
-		    (u_longlong_t)total_found,
-		    (u_longlong_t)total_alloc,
-		    (dump_opt['L']) ? "unreachable" : "leaked",
-		    (longlong_t)(total_alloc - total_found));
-		leaks = B_TRUE;
+		if (total_found == total_alloc) {
+			(void) printf("\n\tNo leaks (block sum matches space"
+			    " maps exactly)\n");
+		} else {
+			(void) printf("block traversal size %llu != alloc %llu "
+			    "(leaked %lld)\n",
+			    (u_longlong_t)total_found,
+			    (u_longlong_t)total_alloc,
+			    (longlong_t)(total_alloc - total_found));
+			leaks = B_TRUE;
+		}
 	}
 
 	if (tzb->zb_count == 0)
@@ -5459,7 +5452,7 @@ dump_block_stats(spa_t *spa)
 		    100.0 * alloc / space);
 	}
 
-	for (i = 0; i < NUM_BP_EMBEDDED_TYPES; i++) {
+	for (bp_embedded_type_t i = 0; i < NUM_BP_EMBEDDED_TYPES; i++) {
 		if (zcb.zcb_embedded_blocks[i] == 0)
 			continue;
 		(void) printf("\n");
@@ -5504,11 +5497,10 @@ dump_block_stats(spa_t *spa)
 	}
 
 	if (dump_opt['b'] >= 2) {
-		int l, t, level;
 		(void) printf("\nBlocks\tLSIZE\tPSIZE\tASIZE"
 		    "\t  avg\t comp\t%%Total\tType\n");
 
-		for (t = 0; t <= ZDB_OT_TOTAL; t++) {
+		for (int t = 0; t <= ZDB_OT_TOTAL; t++) {
 			char csize[32], lsize[32], psize[32], asize[32];
 			char avg[32], gang[32];
 			const char *typename;
@@ -5540,9 +5532,9 @@ dump_block_stats(spa_t *spa)
 				continue;
 			}
 
-			for (l = ZB_TOTAL - 1; l >= -1; l--) {
-				level = (l == -1 ? ZB_TOTAL : l);
-				zb = &zcb.zcb_type[level][t];
+			for (int l = ZB_TOTAL - 1; l >= -1; l--) {
+				int level = (l == -1 ? ZB_TOTAL : l);
+				zdb_blkstats_t *zb = &zcb.zcb_type[level][t];
 
 				if (zb->zb_asize == 0)
 					continue;
