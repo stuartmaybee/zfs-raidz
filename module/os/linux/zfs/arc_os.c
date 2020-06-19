@@ -273,9 +273,11 @@ __arc_shrinker_func(struct shrinker *shrink, struct shrink_control *sc)
 	 * requested amount.
 	 */
 	if (pages > 0) {
+#if 1
 		arc_reduce_target_size(ptob(sc->nr_to_scan));
 		if (current_is_kswapd())
 			arc_kmem_reap_soon();
+#endif
 #ifdef HAVE_SPLIT_SHRINKER_CALLBACK
 		pages = MAX((int64_t)pages -
 		    (int64_t)btop(arc_evictable_memory()), 0);
