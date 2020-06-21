@@ -279,6 +279,12 @@ __arc_shrinker_func(struct shrinker *shrink, struct shrink_control *sc)
 			arc_kmem_reap_soon();
 #endif
 #ifdef HAVE_SPLIT_SHRINKER_CALLBACK
+		/*
+		 * XXX this will often be zero, because of course we didn't
+		 * actually free anything.  However, it appears that the caller
+		 * doesn't actually use the return value (vmscan.c:shrink_node
+		 * in linux 5.0).
+		 */
 		pages = MAX((int64_t)pages -
 		    (int64_t)btop(arc_evictable_memory()), 0);
 #else
