@@ -274,6 +274,23 @@ __arc_shrinker_func(struct shrinker *shrink, struct shrink_control *sc)
 	 */
 	if (pages > 0) {
 		arc_reduce_target_size(ptob(sc->nr_to_scan));
+
+		/*
+		 * XXX not sure if blocking for eviction for "direct reclaim"
+		 * (i.e. from the thread of arbitrary memory allocation calls)
+		 * could lead to deadlock.
+		 */
+		if (current_is_kswapd()) {
+			mutex_enter(&arc_adjust_lock);
+			if (arc_is_overflowing()) {
+				arc_adjust_needed = B_TRUE;
+				zthr_wakeup(arc_adjust_zthr);
+				(void) cv_wait(&arc_adjust_waiters_cv,
+				    &arc_adjust_lock);
+			}
+			mutex_exit(&arc_adjust_lock);
+		}
+
 #if 0
 		if (current_is_kswapd())
 			arc_kmem_reap_soon();
