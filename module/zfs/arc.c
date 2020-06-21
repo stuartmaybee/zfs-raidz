@@ -4858,6 +4858,7 @@ arc_reap_cb(void *arg, zthr_t *zthr)
 	if (to_free > 0) {
 #ifdef _KERNEL
 		to_free = MAX(to_free, arc_need_free);
+		arc_need_free = 0;
 #endif
 		arc_reduce_target_size(to_free);
 	}
