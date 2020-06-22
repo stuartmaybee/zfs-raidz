@@ -101,6 +101,7 @@ cols = {
     "grow":       [4, 1000, "ARC grow disabled"],
     "need":       [4, 1024, "ARC reclaim need"],
     "free":       [4, 1024, "ARC free memory"],
+    "avail":       [4, 1024, "ARC available memory"],
 }
 
 v = {}
@@ -449,7 +450,8 @@ def calculate():
 
     v["grow"] = 0 if cur["arc_no_grow"] else 1
     v["need"] = cur["arc_need_free"]
-    v["free"] = cur["arc_sys_free"]
+    v["free"] = cur["memory_free_bytes"]
+    v["avail"] = cur["memory_available_bytes"]
 
 
 def main():
