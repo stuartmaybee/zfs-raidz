@@ -274,6 +274,7 @@ __arc_shrinker_func(struct shrinker *shrink, struct shrink_control *sc)
 #endif
 	}
 
+#if 0
 	/* Reclaim in progress */
 	if (mutex_tryenter(&arc_adjust_lock) == 0) {
 		ARCSTAT_INCR(arcstat_need_free, ptob(sc->nr_to_scan));
@@ -281,6 +282,7 @@ __arc_shrinker_func(struct shrinker *shrink, struct shrink_control *sc)
 	}
 
 	mutex_exit(&arc_adjust_lock);
+#endif
 
 	/*
 	 * Evict the requested number of pages by shrinking arc_c the
