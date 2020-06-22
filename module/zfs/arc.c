@@ -313,7 +313,7 @@ boolean_t arc_watch = B_FALSE;
  * calling arc_kmem_reap_soon() plus arc_reduce_target_size(), which improves
  * arc_available_memory().
  */
-static zthr_t		*arc_reap_zthr;
+zthr_t		*arc_reap_zthr;
 
 /*
  * This thread's job is to keep arc_size under arc_c, by calling

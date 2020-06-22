@@ -879,6 +879,7 @@ extern hrtime_t arc_growtime;
 extern boolean_t arc_warm;
 extern int arc_grow_retry;
 extern int arc_shrink_shift;
+extern zthr_t		*arc_reap_zthr;
 extern zthr_t		*arc_adjust_zthr;
 extern kmutex_t		arc_adjust_lock;
 extern kcondvar_t	arc_adjust_waiters_cv;

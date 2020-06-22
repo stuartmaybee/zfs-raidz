@@ -261,14 +261,24 @@ __arc_shrinker_func(struct shrinker *shrink, struct shrink_control *sc)
 		ARCSTAT_INCR(arcstat_need_free, ptob(sc->nr_to_scan));
 
 #ifdef HAVE_SPLIT_SHRINKER_CALLBACK
-		/*
-		 * XXX this will often be zero, because of course we didn't
-		 * actually free anything.  However, it appears that the caller
-		 * doesn't actually use the return value (vmscan.c:shrink_node
-		 * in linux 5.0).
-		 */
-		return (MAX((int64_t)pages -
-		    (int64_t)btop(arc_evictable_memory()), 0));
+		return (0);
+#else
+		return (btop(arc_evictable_memory()));
+#endif
+	}
+
+	/*
+	 * kswapd doesn't know how much we evict, because it's only looking
+	 * for pages to be added to the inactive lists.  This causes it to
+	 * ask us to evict the entire ARC.  Instead, we ignore its requests
+	 * and manage the free memory in arc_reap_cb[_check]().
+	 */
+	if (current_is_kswapd()) {
+		if (arc_reclaim_needed()) {
+			zthr_wakeup(arc_reap_zthr);
+		}
+#ifdef HAVE_SPLIT_SHRINKER_CALLBACK
+		return (0);
 #else
 		return (btop(arc_evictable_memory()));
 #endif
