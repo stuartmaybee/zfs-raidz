@@ -4149,6 +4149,15 @@ arc_evict_state_impl(multilist_t *ml, int idx, arc_buf_hdr_t *marker,
 
 	multilist_sublist_unlock(mls);
 
+	/*
+	 * If the ARC size is reduced from arc_c_max to arc_c_min (especially
+	 * if the average cached block is small), eviction can be on-CPU for
+	 * many seconds.  To ensure that other threads that may be bound to
+	 * this CPU are able to make progress, make a voluntary preemption
+	 * call here.
+	 */
+	cond_resched();
+
 	return (bytes_evicted);
 }
 
