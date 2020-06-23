@@ -277,7 +277,11 @@ __arc_shrinker_func(struct shrinker *shrink, struct shrink_control *sc)
 
 	/* Not allowed to perform filesystem reclaim */
 	if (!(sc->gfp_mask & __GFP_FS)) {
+		/*
 		ARCSTAT_INCR(arcstat_need_free, ptob(sc->nr_to_scan));
+		*/
+		if (sc->nr_to_scan == 0)
+			return (0);
 
 #ifdef HAVE_SPLIT_SHRINKER_CALLBACK
 		return (0);
